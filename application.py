@@ -1,3 +1,4 @@
+from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import pyodbc
@@ -11,7 +12,7 @@ app = Flask(__name__)
 CORS(app, origins=[
     "http://localhost:3000",
     "https://main.d1kjnkw0alpy3y.amplifyapp.com"
-])  # Allow local dev + Amplify frontend
+])
 application = app
 
 # ─── Configuration ───────────────────────────────────────────────────────────
@@ -32,10 +33,12 @@ def get_connection():
 # ─── Generate SQL via OpenAI API ─────────────────────────────────────────────
 def generate_sql(prompt):
     system_prompt = (
-        "You are a T-SQL expert. Generate valid SQL Server queries only.\n"
-        "Use uppercase SQL keywords and [square brackets] around identifiers.\n"
-        "If multiple tables are involved, use JOINs with proper ON clauses.\n"
-        "Start CTEs with a semicolon. Do not include markdown or comments."
+        "You are a T-SQL expert. Generate only valid Microsoft SQL Server SELECT queries.\n"
+        "Use uppercase SQL keywords and [square brackets] for all identifiers.\n"
+        "NEVER use the keyword TO unless it's part of BETWEEN ... AND ...\n"
+        "Avoid SELECT INTO, INSERT, UPDATE, DELETE, CREATE, or markdown formatting.\n"
+        "Use JOINs with ON clauses when necessary. Start CTEs with a semicolon.\n"
+        "Only return the clean T-SQL query—no explanations or comments."
     )
     payload = {
         "model": "gpt-4o",
@@ -58,7 +61,12 @@ def generate_sql(prompt):
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             result = json.loads(resp.read().decode("utf-8"))
-            return result["choices"][0]["message"]["content"].strip()
+            sql = result["choices"][0]["message"]["content"].strip()
+            # Basic guard against invalid TO usage
+            upper = sql.upper()
+            if " TO " in upper and "BETWEEN" not in upper:
+                raise Exception("Invalid use of 'TO' keyword detected in SQL.")
+            return sql
     except urllib.error.HTTPError as e:
         raise Exception(f"OpenAI API error {e.code}: {e.read().decode()}")
     except Exception as e:
@@ -69,9 +77,9 @@ def introspect_schema():
     conn = get_connection()
     cur = conn.cursor()
 
-    # Table + column list
     cur.execute("""
-        SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES
+        SELECT TABLE_NAME
+        FROM INFORMATION_SCHEMA.TABLES
         WHERE TABLE_TYPE='BASE TABLE' AND TABLE_SCHEMA='dbo'
     """)
     tables = [r[0] for r in cur.fetchall()]
@@ -79,17 +87,16 @@ def introspect_schema():
     for table in tables:
         c = conn.cursor()
         c.execute("""
-            SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
             WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME=?
             ORDER BY ORDINAL_POSITION
         """, table)
-        columns = [col[0] for col in c.fetchall()]
-        schema_lines.append(f"[{table}](" + ",".join(f"[{col}]" for col in columns) + ")")
-    schema_text = "; ".join(schema_lines)
+        cols = [col[0] for col in c.fetchall()]
+        schema_lines.append(f"[{table}](" + ",".join(f"[{col}]" for col in cols) + ")")
 
-    # FK relationships
     cur.execute("""
-        SELECT 
+        SELECT
             FK.TABLE_NAME AS FK_TABLE,
             CU.COLUMN_NAME AS FK_COLUMN,
             PK.TABLE_NAME AS PK_TABLE,
@@ -110,9 +117,9 @@ def introspect_schema():
         ) PT ON PT.CONSTRAINT_NAME = PK.CONSTRAINT_NAME
     """)
     rels = [f"{r.FK_TABLE}.{r.FK_COLUMN} = {r.PK_TABLE}.{r.PK_COLUMN}" for r in cur.fetchall()]
-    conn.close()
 
-    return schema_text, "; ".join(rels)
+    conn.close()
+    return "; ".join(schema_lines), "; ".join(rels)
 
 # ─── /query ─────────────────────────────────────────────────────────────────
 @app.route("/query", methods=["POST"])
@@ -124,9 +131,13 @@ def query():
             return jsonify({"error": "Missing 'question'"}), 400
 
         schema_text, rel_text = introspect_schema()
+
+        now = datetime.now()
         prompt = (
-            "Database schema:\n" + schema_text + "\n\n"
-            "Relationships:\n" + rel_text + "\n\n"
+            f"Today's date is {now:%Y-%m-%d}. The current year is {now.year} "
+            f"and the current month is {now.month}.\n\n"
+            f"Database schema:\n{schema_text}\n\n"
+            f"Relationships:\n{rel_text}\n\n"
             f"Convert the following natural-language question into valid T-SQL:\n"
             f"Question: {question}\n"
             "SQL:"
@@ -152,7 +163,7 @@ def query():
         logging.error(f"[ERROR] {e}")
         return jsonify({"error": str(e)}), 500
 
-# ─── /tables (list tables) ──────────────────────────────────────────────────
+# ─── /tables ─────────────────────────────────────────────────────────────────
 @app.route("/tables", methods=["GET"])
 def list_tables():
     conn = get_connection()
@@ -166,7 +177,7 @@ def list_tables():
     conn.close()
     return jsonify({"tables": tables}), 200
 
-# ─── /tables/<table> (get full table) ───────────────────────────────────────
+# ─── /tables/<table> ─────────────────────────────────────────────────────────
 @app.route("/tables/<table_name>", methods=["GET"])
 def get_table(table_name):
     conn = get_connection()
